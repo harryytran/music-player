@@ -1,0 +1,14 @@
+[package]
+name = "music-player"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossterm = "0.27"
+ratatui = "0.24"
+rodio = "0.17"
+walkdir = "2.4"
+id3 = "1.8"
+metaflac = "0.2"
+lewton = "0.10"
+anyhow = "1.0" 
