@@ -31,6 +31,7 @@ enum PlayerMessage {
     Quit,
     AddDirectory(PathBuf),
     RemoveDirectory(usize),
+    SetVolume(f32),
 }
 
 struct MusicPlayer {
@@ -39,12 +40,12 @@ struct MusicPlayer {
     _player_tx: Sender<PlayerMessage>,
     is_playing: bool,
     music_dirs: Vec<PathBuf>,
+    volume: f32,
 }
 
 impl MusicPlayer {
     fn new(music_dirs: &[PathBuf]) -> Result<Self> {
         let mut songs = Vec::new();
-        
         for dir in music_dirs {
             for entry in WalkDir::new(dir).follow_links(true) {
                 let entry = entry?;
@@ -64,6 +65,7 @@ impl MusicPlayer {
         thread::spawn(move || {
             let (_stream, stream_handle) = OutputStream::try_default().unwrap();
             let mut sink: Option<Sink> = None;
+            let mut current_volume = 1.0;
 
             while let Ok(msg) = rx.recv() {
                 match msg {
@@ -71,14 +73,20 @@ impl MusicPlayer {
                         if let Some(s) = sink.take() {
                             s.stop();
                         }
-                        
                         if let Ok(file) = std::fs::File::open(&path) {
                             if let Ok(source) = Decoder::new(file) {
                                 let new_sink = Sink::try_new(&stream_handle).unwrap();
+                                new_sink.set_volume(current_volume);
                                 new_sink.append(source);
                                 new_sink.play();
                                 sink = Some(new_sink);
                             }
+                        }
+                    }
+                    PlayerMessage::SetVolume(vol) => {
+                        current_volume = vol;
+                        if let Some(s) = &sink {
+                            s.set_volume(vol);
                         }
                     }
                     PlayerMessage::Stop => {
@@ -98,6 +106,7 @@ impl MusicPlayer {
             _player_tx: tx,
             is_playing: false,
             music_dirs: music_dirs.to_vec(),
+            volume: 1.0,
         })
     }
 
@@ -161,13 +170,18 @@ impl MusicPlayer {
         let removed_dir = &self.music_dirs[index];
         self.songs.retain(|path| !path.starts_with(removed_dir));
         self.music_dirs.remove(index);
-        
+
         // Reset current index if needed
         if self.current_index >= self.songs.len() {
             self.current_index = self.songs.len().saturating_sub(1);
         }
-        
+
         Ok(())
+    }
+
+    fn set_volume(&mut self, delta: f32) {
+        self.volume = (self.volume + delta).clamp(0.0, 1.0);
+        self._player_tx.send(PlayerMessage::SetVolume(self.volume)).unwrap();
     }
 }
 
@@ -188,9 +202,8 @@ fn main() -> Result<()> {
 
     let initial_dirs = vec![
         PathBuf::from("C:/Users/lintr/AppData/Roaming/Python/Python312/Scripts"),
-        
     ];
-    
+
     let mut app = App {
         player: MusicPlayer::new(&initial_dirs)?,
         command_mode: false,
@@ -198,15 +211,19 @@ fn main() -> Result<()> {
         message: None,
     };
 
+    let mut scroll_offset = 0;
+    let mut last_key_time = std::time::Instant::now();
+    let key_delay = Duration::from_millis(150); // 150ms delay between key presses
+
     loop {
         terminal.draw(|f| {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),  // Title
-                    Constraint::Min(0),     // Songs
-                    Constraint::Length(3),  // Directories
-                    Constraint::Length(3),  // Controls/Command
+                    Constraint::Length(3), // Title
+                    Constraint::Min(0),    // Songs
+                    Constraint::Length(3), // Directories
+                    Constraint::Length(3), // Controls/Command
                 ])
                 .split(f.size());
 
@@ -234,7 +251,9 @@ fn main() -> Result<()> {
                 .collect();
 
             let songs_list = List::new(songs)
-                .block(Block::default().borders(Borders::ALL).title("Songs"));
+                .block(Block::default().borders(Borders::ALL).title(
+                    format!("Songs (Volume: {}%)", (app.player.volume * 100.0) as i32)
+                ));
             f.render_widget(songs_list, chunks[1]);
 
             // Directories list
@@ -264,6 +283,7 @@ fn main() -> Result<()> {
                         Span::raw("Space: Play/Pause | "),
                         Span::raw("n: Next | "),
                         Span::raw("p: Previous | "),
+                        Span::raw("-/+: Volume | "),
                         Span::raw(":: Command | "),
                         Span::raw("q: Quit"),
                     ]),
@@ -282,6 +302,12 @@ fn main() -> Result<()> {
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                let now = std::time::Instant::now();
+                if now.duration_since(last_key_time) < key_delay {
+                    continue;
+                }
+                last_key_time = now;
+
                 if app.command_mode {
                     match key.code {
                         KeyCode::Enter => {
@@ -328,8 +354,20 @@ fn main() -> Result<()> {
                                 app.player.play_current();
                             }
                         }
-                        KeyCode::Char('n') => app.player.next(),
-                        KeyCode::Char('p') => app.player.previous(),
+                        KeyCode::Char('n') => {
+                            app.player.next();
+                            if app.player.current_index as i32 - scroll_offset >= 10 {
+                                scroll_offset = app.player.current_index as i32 - 5;
+                            }
+                        },
+                        KeyCode::Char('p') => {
+                            app.player.previous();
+                            if app.player.current_index as i32 - scroll_offset < 0 {
+                                scroll_offset = (app.player.current_index as i32).max(0);
+                            }
+                        },
+                        KeyCode::Char('+') | KeyCode::Char('=') => app.player.set_volume(0.05),
+                        KeyCode::Char('-') => app.player.set_volume(-0.05),
                         KeyCode::Char(':') => {
                             app.command_mode = true;
                             app.message = None;
@@ -344,6 +382,5 @@ fn main() -> Result<()> {
     // Cleanup
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-
     Ok(())
-} 
+}
